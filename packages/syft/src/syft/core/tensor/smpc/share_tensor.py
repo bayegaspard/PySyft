@@ -20,18 +20,41 @@ from syft.core.common.serde.serializable import Serializable
 from syft.core.common.serde.serializable import bind_protobuf
 from syft.core.common.serde.serialize import _serialize as serialize
 from syft.core.tensor.passthrough import PassthroughTensor
-from syft.proto.core.tensor.share_tensor_pb2 import ShareTensor as ShareTensor_PB
+from syft.proto.core.tensor.smpc.share_tensor_pb2 import ShareTensor as ShareTensor_PB
 
 
 @bind_protobuf
 class ShareTensor(PassthroughTensor, Serializable):
+    __slots__ = (
+        "rank",
+        "ring_size",
+        "generator_przs",
+        "nr_parties",
+        "min_value",
+        "max_value",
+    )
+
     def __init__(
         self,
         rank: int,
         nr_parties: int,
         ring_size: int = 2 ** 64,
         value: Optional[Any] = None,
+        seed_shares: Optional[int] = None,
+        generator_przs: Optional[Any] = None,  # TODO: Add correct type
     ) -> None:
+
+        if (seed_shares is None) == (generator is None):
+            raise ValueError("Only seed_shares or generator should be populated!")
+
+        self.generator_przs = None
+        self.seed_shares = None
+
+        if generator_przs:
+            self.generator_przs = generator
+        else:
+            self.seed_shares = seed_shares
+
         self.rank = rank
         self.ring_size = ring_size
         self.nr_parties = nr_parties
@@ -66,7 +89,11 @@ class ShareTensor(PassthroughTensor, Serializable):
 
     def copy_tensor(self) -> ShareTensor:
         return ShareTensor(
-            rank=self.rank, nr_parties=self.nr_parties, ring_size=self.ring_size
+            rank=self.rank,
+            nr_parties=self.nr_parties,
+            ring_size=self.ring_size,
+            generator=_self.generator_przs,
+            seed_shares=self.seed_shares,
         )
 
     @staticmethod
@@ -124,11 +151,15 @@ class ShareTensor(PassthroughTensor, Serializable):
         shape: Tuple[int],
         rank: int,
         nr_parties: int,
-        seed_shares: int,
+        seed_shares: Optional[int] = None,
+        generator: Optional[Any] = None,
     ) -> "ShareTensor":
 
         # syft absolute
         from syft.core.tensor.tensor import Tensor
+
+        if (seed_shares is None) == (generator is None):
+            raise ValueError("Only seed_shares or generator should be populated")
 
         if value is None:
             value = Tensor(np.zeros(shape, dtype=np.int32))  # TODO: change to np.int64
@@ -138,11 +169,19 @@ class ShareTensor(PassthroughTensor, Serializable):
         # when shares are not sent between parties -- like private addition/subtraction, but it might
         # impose for multiplication
         # The secret holder should generate the shares and send them to the other parties
-        generator_shares = np.random.default_rng(seed_shares)
+        if generator:
+            generator_shares = generator
+        else:
+            generator_shares = np.random.default_rng(seed_shares)
 
         share = value.child
         if not isinstance(share, ShareTensor):
-            share = ShareTensor(value=share, rank=rank, nr_parties=nr_parties)
+            share = ShareTensor(
+                value=share,
+                rank=rank,
+                nr_parties=nr_parties,
+                generator_przs=generator_shares,
+            )
 
         shares = [
             generator_shares.integers(
@@ -351,19 +390,31 @@ class ShareTensor(PassthroughTensor, Serializable):
     #     return res
 
     def _object2proto(self) -> ShareTensor_PB:
+        if self.generator_przs is not None:
+            raise ValueError(
+                "Should not attempt to send a ShareTensor that has a generator instanciated"
+            )
+
         if isinstance(self.child, np.ndarray):
             return ShareTensor_PB(
-                array=serialize(self.child), rank=self.rank, nr_parties=self.nr_parties
+                array=serialize(self.child),
+                rank=self.rank,
+                nr_parties=self.nr_parties,
+                seed_shares=self.seed_shares,
             )
         elif isinstance(self.child, torch.Tensor):
             return ShareTensor_PB(
                 array=serialize(np.array(self.child)),
                 rank=self.rank,
                 nr_parties=self.nr_parties,
+                seed_shares=self.seed_shares,
             )
         else:
             return ShareTensor_PB(
-                tensor=serialize(self.child), rank=self.rank, nr_parties=self.nr_parties
+                tensor=serialize(self.child),
+                rank=self.rank,
+                nr_parties=self.nr_parties,
+                seed_shares=self.seed_shares,
             )
 
     @staticmethod
@@ -373,12 +424,14 @@ class ShareTensor(PassthroughTensor, Serializable):
                 rank=proto.rank,
                 nr_parties=proto.nr_parties,
                 value=deserialize(proto.tensor),
+                generator=np.default_rng(proto.seed_shares),
             )
         else:
             res = ShareTensor(
                 rank=proto.rank,
                 nr_parties=proto.nr_parties,
                 value=deserialize(proto.array),
+                generator=np.default_rng(proto.seed_shares),
             )
 
         return res
